@@ -3501,16 +3501,11 @@ fn materialize_semantic_dimensions(properties: &mut Value, dimensions: usize) {
 
 /// The width this server's embedding backend actually produces: the confirmed
 /// identity width (for `proxy` this runs the #2306 probe, cached after the
-/// first confirmation), else 384 — the built-in default a bare mapping was
-/// always sized at. Resolved only when a mapping actually carries a bare
-/// `semantic_text`, so mappings without one never pay for a probe.
+/// first confirmation), else 384 with a warning — the built-in default a bare
+/// mapping was always sized at. Resolved only when a mapping actually carries
+/// a bare `semantic_text`, so mappings without one never pay for a probe.
 fn confirmed_semantic_dimensions(state: &AppState) -> usize {
-    state
-        .engine
-        .embedding_execution_identity()
-        .ok()
-        .and_then(|identity| identity.dimensions)
-        .unwrap_or(384)
+    state.engine.confirmed_semantic_dimensions()
 }
 
 fn semantic_mapping_contract(

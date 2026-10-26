@@ -4376,12 +4376,23 @@ impl Engine {
     /// Return the effective embedding identity without exposing configuration
     /// secrets or local asset paths.
     /// The width a bare `semantic_text` is sized at (#2407): the backend's
-    /// confirmed width when one exists, else the built-in default.
-    pub(crate) fn confirmed_semantic_dimensions(&self) -> usize {
-        self.embedding_execution_identity()
-            .ok()
-            .and_then(|identity| identity.dimensions)
-            .unwrap_or(xerj_ai::local::DEFAULT_DIMS)
+    /// confirmed width when one exists, else the built-in default, with a
+    /// warning, since that fallback only matches a 384-wide backend.
+    pub fn confirmed_semantic_dimensions(&self) -> usize {
+        let unconfirmed = match self.embedding_execution_identity() {
+            Ok(identity) => match identity.dimensions {
+                Some(dimensions) => return dimensions,
+                None => format!("the {} backend has not confirmed a width", identity.backend),
+            },
+            Err(error) => error.to_string(),
+        };
+        warn!(
+            reason = %unconfirmed,
+            fallback = xerj_ai::local::DEFAULT_DIMS,
+            "bare semantic_text sized at the built-in default width; declare `dimensions` \
+             if the embedding backend returns another width"
+        );
+        xerj_ai::local::DEFAULT_DIMS
     }
 
     pub fn embedding_execution_identity(&self) -> Result<EmbeddingExecutionIdentity> {

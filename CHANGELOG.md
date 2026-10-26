@@ -79,6 +79,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `semantic_text` field declared without `dimensions` is now sized at the
+  width the server's embedding backend actually produces, when that width is
+  confirmed (#2407, defect 1). It used to be always 384, so behind a `proxy`
+  returning another width (768, 1024, …) every document failed ingest with
+  "embedding backend returned width N, mapping requires 384", and the new
+  index stayed green with no semantic documents. Index creation,
+  `PUT _mapping` and templates (including indices that `_bulk` creates
+  automatically) write the width into the mapping, so `GET _mapping` shows it.
+  An explicit `dimensions` still wins. Indices created before this change keep
+  their stored 384 mapping. Re-declaring a bare `semantic_text` on one of them
+  while running a backend of another width is now refused by the immutable
+  embedding contract. When the width cannot be confirmed, the field is still
+  sized at 384, and the server logs a warning.
+
 - The parent memory breaker no longer flaps, and background merges and flush
   finalizes are bounded while it is engaged (#2427). A 3,000 MB autoindex run
   engaged the breaker 20 times in 16 minutes, often releasing 100-500 ms
