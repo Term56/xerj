@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `xerj corpus add` accepts a local Windows path such as
+  `F:\Projects\Foo` (#2472). The repo name was the text after the last `/`,
+  so a `\`-separated path stayed whole and was refused as an unsafe repo
+  name; it now names the repo `Foo`, as `F:/Projects/Foo` already did.
+
 - `xerj code` shows the part of a long definition that matched the query,
   not its first `--full` characters (#2464). The matching text could sit
   thousands of characters below the signature, so a hit named the right
