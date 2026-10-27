@@ -154,6 +154,13 @@ continues in #2427 and #1122, which stay open.
 
 ### Fixed
 
+- `xerj corpus add` clones a repo again when an earlier clone of it did not
+  finish (#2453). A clone killed partway, for example by an agent's tool
+  timeout, leaves `.git` with no commit, and re-adding skipped it as
+  "already cloned", leaving an empty repo in the corpus. It now prints
+  `[reclone]`, removes the unfinished clone and clones it again. A finished
+  clone is still skipped.
+
 - `xerj corpus add` accepts a local Windows path such as
   `F:\Projects\Foo` (#2472). The repo name was the text after the last `/`,
   so a `\`-separated path stayed whole and was refused as an unsafe repo

@@ -486,6 +486,17 @@ pub(crate) fn git(dir: Option<&Path>, args: &[&str]) -> Result<(i32, String)> {
     ))
 }
 
+/// #2453: a clone killed partway (an agent's tool timeout) leaves `.git`
+/// with no commit checked out. `.git` alone is not a finished clone.
+fn clone_has_commit(target: &Path) -> bool {
+    target.join(".git").exists()
+        && git(
+            Some(target),
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        )
+        .is_ok_and(|(rc, _)| rc == 0)
+}
+
 /// How much of git's own stdout/stderr a fetch failure keeps. A TLS
 /// intercept or a rejected pin is a paragraph; the rest of the bail stays
 /// one line an agent can read.
@@ -1265,6 +1276,19 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 own,
             );
             continue;
+        }
+        if target.join(".git").exists() && !clone_has_commit(&target) {
+            // A pin fetches into the existing repo above; an unpinned clone
+            // starts again. `target` is the gated name under the corpus dir.
+            println!("  [reclone] {repo_name}: the previous clone did not finish");
+            if let Err(e) = std::fs::remove_dir_all(&target) {
+                eprintln!(
+                    "  [FAIL] {repo_name}: could not remove the unfinished clone at {}: {e}; continuing",
+                    target.display()
+                );
+                skipped.push(repo_name);
+                continue;
+            }
         }
         if target.join(".git").exists() {
             println!("  [skip] {repo_name} already cloned");
@@ -5514,6 +5538,41 @@ precedence = ["a", "b"]
         assert!(CORPUS_USAGE.contains("xerj corpus own"));
         assert!(CORPUS_USAGE.contains("--own"));
         assert!(CORPUS_USAGE.contains("file classes") || CORPUS_USAGE.contains("per-file-class"));
+    }
+
+    /// #2453: a clone killed partway leaves `.git` and no commit. Re-adding
+    /// clones it again instead of skipping it as "already cloned"; a finished
+    /// clone is still skipped and left as it is.
+    #[test]
+    fn corpus_add_reclones_a_clone_that_did_not_finish() {
+        let home = tempfile::tempdir().unwrap();
+        let _h = code_home(home.path());
+        let origin = home.path().join("widget");
+        init_committed_repo(&origin, &[("keep.txt", "tracked\n")]);
+        let clone = home.path().join("corpora/reclone/widget");
+        std::fs::create_dir_all(&clone).unwrap();
+        let (rc, out) = git(Some(&clone), &["init", "--quiet"]).unwrap();
+        assert_eq!(rc, 0, "git init: {out}");
+        assert!(
+            !clone_has_commit(&clone),
+            "the fixture must look interrupted"
+        );
+
+        let add = || run_corpus_add(&["reclone".into(), origin.display().to_string()]);
+        assert_eq!(add(), 0);
+        assert!(clone_has_commit(&clone));
+        assert_eq!(
+            std::fs::read_to_string(clone.join("keep.txt")).expect("recloned keep.txt"),
+            "tracked\n",
+            "an unfinished clone must be cloned again, not skipped"
+        );
+
+        std::fs::write(clone.join("local-note.txt"), "kept\n").unwrap();
+        assert_eq!(add(), 0);
+        assert!(
+            clone.join("local-note.txt").exists(),
+            "a finished clone is skipped, not cloned again"
+        );
     }
 
     /// #2199: `git clone` of a local path checks out committed files only.
