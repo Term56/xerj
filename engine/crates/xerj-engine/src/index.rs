@@ -2306,9 +2306,10 @@ mod flush_publication_recovery_tests {
         }
     }
 
-    /// #2427: a query the segment FTS declines (here a clause on a field no
-    /// document has, the shape the multi-index code-search CLI sends) walks
-    /// every cold segment through the brute stored scan. That scan decoded
+    /// #2427: a query the segment FTS declines (here a `range` should-clause
+    /// on a field no document has; #2467 lets the FTS skip unmapped
+    /// term/phrase leaves, but not `range`/`exists`) walks every cold
+    /// segment through the brute stored scan. That scan decoded
     /// every column — on a semantic_text corpus ~85% embedding companions —
     /// although the page can only observe the `_source` includes plus the
     /// fields the query reads. With an include list the cold decode must
@@ -2369,7 +2370,7 @@ mod flush_publication_recovery_tests {
                 "query": {"bool": {
                     "should": [
                         {"match": {"body": "needle"}},
-                        {"match_phrase": {"defs": "no such field"}}
+                        {"range": {"defs": {"gte": "a"}}}
                     ],
                     "minimum_should_match": 1
                 }},
@@ -14095,6 +14096,29 @@ impl Index {
                     .map(|chunk| chunk.into_iter().map(|i| ids[i].clone()).collect())
                     .collect()
             }
+            // #1122/#2433: at the target count, a forcemerge under
+            // XERJ_STORE_SEMANTIC_VECTORS still rewrites each segment that
+            // holds rows stored without their derived semantic vectors, so
+            // the documented pre-downgrade `_forcemerge` restores them on an
+            // index that is already one segment.
+            Some(_) if xerj_storage::stored_codec::derived_vectors::store_vectors_opt_out() => {
+                let segments_dir = self.data_dir.join("segments");
+                segments_snapshot_init
+                    .iter()
+                    .filter(|meta| {
+                        let Ok(reader) = SegmentReader::open(segments_dir.join(&meta.seg_path))
+                        else {
+                            return false;
+                        };
+                        matches!(
+                            reader.section(SectionType::Stored),
+                            Ok(Some(raw)) if xerj_storage::stored_codec::stored_has_derived_rows(raw)
+                                .unwrap_or(false)
+                        )
+                    })
+                    .map(|meta| vec![meta.id.clone()])
+                    .collect()
+            }
             Some(_) => Vec::new(),
             None => policy.select_merges(&segments_snapshot_init),
         };
@@ -14381,6 +14405,44 @@ impl Index {
                 );
                 true
             };
+            // #2427 — the output-write step (doc-values build, stored
+            // encode, FTS side-car build) runs after the last `must_yield`
+            // checkpoint and is the batch's peak: large pg-docs merges took a
+            // 3,072 MB search node to 4.4–4.9 GB there, about 5 s before they
+            // completed. It is charged to the batch's merge reservation before
+            // it starts, and refused (the batch yields, inputs kept, later
+            // batches narrowed) when it would take RSS to the hard limit. See
+            // `ResourceGovernor::admit_merge_write`.
+            let admit_write = move |reservation: Option<&mut crate::governor::MergeReservation>,
+                                    held: u64,
+                                    extra: u64|
+                  -> bool {
+                let Some(governor) = crate::governor::global() else {
+                    return true;
+                };
+                // #2468 lets a small background batch run to completion
+                // after a streak of yields with nothing merged. When that
+                // rule is what waived this batch's yield, the write runs
+                // too, or refusing it would bring the stall back.
+                let exempt = governor.merge_write_exempt(forced_for_task, input_bytes_for_task);
+                if governor.admit_merge_write(reservation, held, extra, forced_for_task, exempt) {
+                    return true;
+                }
+                let cap = governor.note_merge_yield(input_bytes_for_task);
+                tracing::warn!(
+                    input_mb = input_bytes_for_task / (1024 * 1024),
+                    write_mb = extra / (1024 * 1024),
+                    rss_mb = governor.observed_rss_bytes() / (1024 * 1024),
+                    limit_mb = governor.process_memory_limit_bytes() / (1024 * 1024),
+                    next_batch_cap_mb = cap / (1024 * 1024),
+                    "merge batch yielded before its output write: the write would take RSS \
+                     to the process limit; inputs kept, later batches narrowed"
+                );
+                false
+            };
+            // Held by the encode job until it ends, so the write step can
+            // grow it (see `admit_write`).
+            let mut reservation_for_encode = reservation;
             #[cfg(test)]
             let hold_merge_encode = Arc::clone(&self.test_hold_merge_encode);
             #[cfg(test)]
@@ -14484,14 +14546,19 @@ impl Index {
                     // remapped, not re-derived). `retained_bytes` charges only
                     // what the reader OWNS (an mmap'd `.post` contributes 0),
                     // matching what this batch adds to the heap.
-                    let merge_reader_retained = merge_readers.as_ref().map(|readers| {
-                        let bytes: u64 = readers
-                            .iter()
-                            .map(|reader| reader.retained_bytes())
-                            .sum();
+                    let merge_reader_bytes: u64 = merge_readers
+                        .as_ref()
+                        .map(|readers| {
+                            readers
+                                .iter()
+                                .map(|reader| reader.retained_bytes())
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(0);
+                    let merge_reader_retained = merge_readers.as_ref().map(|_| {
                         crate::ingest_memory::Retained::new(
                             crate::ingest_memory::Category::MergeDecoded,
-                            bytes as usize,
+                            merge_reader_bytes as usize,
                         )
                     });
 
@@ -14712,7 +14779,13 @@ impl Index {
                             }
                         };
                         let stored_bytes =
-                            match xerj_storage::stored_codec::decode_stored(stored_bytes_raw) {
+                            // #1122/#2433: keep stripped semantic vectors
+                                // stripped (the merged encode would only
+                                // re-derive and drop them again), unless
+                                // XERJ_STORE_SEMANTIC_VECTORS restores them.
+                            match xerj_storage::stored_codec::decode_stored_for_rewrite(
+                                stored_bytes_raw,
+                            ) {
                                 Ok(b) => b,
                                 Err(e) => {
                                     tracing::error!(
@@ -14978,6 +15051,29 @@ impl Index {
                     if must_yield() {
                         yielded_for_task.fetch_add(1, Ordering::Relaxed);
                         return None;
+                    }
+                    // #2427 — last chance to stop: everything below allocates
+                    // on top of what the batch holds now and cannot yield.
+                    // Charge it to the merge budget first, or yield.
+                    {
+                        let json_bytes = merged_json_buf.len() as u64;
+                        let fts_bytes = fts_input_bytes as u64;
+                        let write_fts_bytes = if merge_postings {
+                            merge_reader_bytes
+                        } else {
+                            fts_bytes
+                        };
+                        let held = json_bytes
+                            .saturating_add(fts_bytes)
+                            .saturating_add(merge_reader_bytes);
+                        let extra = crate::merge_budget::merge_write_phase_bytes(
+                            json_bytes,
+                            write_fts_bytes,
+                        );
+                        if !admit_write(reservation_for_encode.as_mut(), held, extra) {
+                            yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
                     }
                     // Doc-values columns, built here from the merged stored
                     // JSON one document at a time (#2427) and written once the
@@ -15292,12 +15388,12 @@ impl Index {
                         version_repoint_intents,
                     ))
                 }));
+                // Held until the encode (the allocation-heavy part: stored
+                // decode, FST and doc-values build) has finished.
+                drop(reservation_for_encode);
                 let _ = encode_tx.send(encoded);
             });
             tokio::spawn(async move {
-                // Held until the encode (the allocation-heavy part: stored
-                // decode, FST and doc-values build) has finished.
-                let _reservation = reservation;
                 match encode_rx.await {
                     Ok(Ok(value)) => {
                         if value.is_some() && !forced_for_task {
@@ -58247,12 +58343,12 @@ fn scored_fast_plan(
     }
 }
 
-/// Default chunk size (characters) for auto-embed-on-ingest chunking.
-/// `EmbeddingConfig` has no per-field chunk parameter yet, so this is a
-/// sensible fixed default (roughly a paragraph).
-const SEMANTIC_CHUNK_SIZE: usize = 512;
-/// Default overlap (characters) between consecutive chunks.
-const SEMANTIC_CHUNK_OVERLAP: usize = 64;
+// #1122/#2433: the lexical chunk/embed/pool recipe lives in xerj-ai so the
+// stored-section codec can regenerate the derived vectors bit-identically
+// instead of persisting them in every stored `_source`.
+#[cfg(test)]
+use xerj_ai::semantic_lexical::SEMANTIC_CHUNK_SIZE;
+use xerj_ai::semantic_lexical::{local_chunk_vectors, mean_pool_normalize, semantic_chunker};
 
 /// Select one order-preserving caller-side embedding window. One oversized
 /// document-field job remains whole so the planner always makes progress.
@@ -58590,67 +58686,6 @@ mod semantic_embedding_window_tests {
             );
         }
     }
-}
-
-/// The chunker used by the auto-embed-on-ingest path.
-fn semantic_chunker() -> xerj_ai::TextChunker {
-    xerj_ai::TextChunker::new(SEMANTIC_CHUNK_SIZE, SEMANTIC_CHUNK_OVERLAP)
-}
-
-/// L2-normalize each input vector, mean-pool across all of them, then
-/// re-normalize the pooled result. Produces a unit-norm vector of the same
-/// dimensionality as the inputs (empty input => empty vec). Vectors whose
-/// length differs from the first are skipped.
-fn mean_pool_normalize(vectors: &[Vec<f32>]) -> Vec<f32> {
-    let dims = match vectors.first() {
-        Some(v) => v.len(),
-        None => return Vec::new(),
-    };
-    let mut acc = vec![0.0f32; dims];
-    let mut used = 0usize;
-    for v in vectors {
-        if v.len() != dims {
-            continue;
-        }
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for (a, x) in acc.iter_mut().zip(v.iter()) {
-                *a += x / norm;
-            }
-            used += 1;
-        }
-    }
-    if used > 0 {
-        let inv = 1.0 / used as f32;
-        for a in acc.iter_mut() {
-            *a *= inv;
-        }
-    }
-    // Re-normalize the pooled vector to unit length.
-    let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for a in acc.iter_mut() {
-            *a /= norm;
-        }
-    }
-    acc
-}
-
-/// Chunk `text` and embed each overlapping chunk with the built-in *local*
-/// embedder, returning one unit-norm vector per passage. Short text
-/// (<= chunk_size) produces a single chunk, so the result is
-/// `vec![local_embed(text, dims)]`. This is the per-chunk primitive used by
-/// the auto-embed-on-ingest path to persist passage vectors for max-sim
-/// semantic scoring.
-fn local_chunk_vectors(text: &str, dims: usize) -> Vec<Vec<f32>> {
-    let chunks = semantic_chunker().chunk(text, None);
-    if chunks.len() <= 1 {
-        return vec![xerj_ai::local::local_embed(text, dims)];
-    }
-    chunks
-        .iter()
-        .map(|c| xerj_ai::local::local_embed(&c.text, dims))
-        .collect()
 }
 
 /// Chunk `text` and mean-pool the per-chunk *local* embeddings into a single

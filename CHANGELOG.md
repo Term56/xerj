@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Stored `semantic_text` vectors** (PR
+  [#2471](https://github.com/xerj-org/xerj/pull/2471)). Segments written by
+  this build no longer store the vectors the built-in lexical embedder
+  derives for a `semantic_text` field (`<target>` and `<target>_chunks`) in
+  the stored `_source`; readers rebuild them from the text. Older segments
+  open unchanged and lose their stored copy when a merge rewrites them.
+  There is no format-marker change, so an older binary still opens the
+  index, but it reads those rows without vectors: `_source` lacks them and
+  semantic and kNN recall on them drops until the index is reindexed.
+  Before downgrading, restart this build with
+  `XERJ_STORE_SEMANTIC_VECTORS=1` and run `POST /{index}/_forcemerge?max_num_segments=1`
+  on each index with a `semantic_text` field: with the variable set, flushes
+  store full vectors and a merge writes them back for rows stored without
+  them. Vectors from neural, ONNX or proxy embedders, and vectors supplied
+  by the caller, were always kept and are not affected.
+
 ### Added
 
 - `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
@@ -77,6 +95,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
   open).
 
+### Changed
+
+- A `semantic_text` field with the built-in lexical embedder no longer
+  stores its embedding twice. The pooled and per-passage vectors were kept
+  in the stored `_source` as well as in the vector index; the columnar
+  stored encoder now drops them when they rebuild bit-exactly from the
+  text, and every reader (`_source`, `GET`, kNN, reindex, snapshot)
+  rebuilds them, so responses are unchanged. On a 6,000-document test the
+  segment file went from 20.1 MB to 1.8 MB and the index from 3.67x to
+  1.63x its source size. The saving is on disk; the HNSW graph in memory is
+  unchanged. Sections under 128 documents keep their vectors.
+  `XERJ_STORE_SEMANTIC_VECTORS=1` turns this off; see the upgrade note
+  (part of [#1122](https://github.com/xerj-org/xerj/issues/1122) and
+  [#2433](https://github.com/xerj-org/xerj/issues/2433)).
+
 ### Fixed
 
 - A `semantic_text` field declared without `dimensions` is now sized at the
@@ -92,6 +125,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while running a backend of another width is now refused by the immutable
   embedding contract. When the width cannot be confirmed, the field is still
   sized at 384, and the server logs a warning.
+
+- `xerj code` shows the part of a long definition that matched the query,
+  not its first `--full` characters (#2464). The matching text could sit
+  thousands of characters below the signature, so a hit named the right
+  function but showed none of the query terms. Such passages now end with
+  `... [function name: showing N of M chars from offset O, window centred on the match]`;
+  the `@ line N` label and citations are unchanged, and a definition whose
+  head is already the best window still ends `truncated at N chars`. Hub ask
+  passages (`xerj ask`) and hub search API hits change the same way.
+
+- A segment merge's output-write step (doc-values build, stored encode, FTS
+  side-car build) is now charged to the merge budget before it starts, and a
+  background batch yields instead of starting it when it would take RSS to
+  the process limit (#2427). That step runs after the last yield checkpoint,
+  and neither admission nor the yield checks saw it: large pg-docs merges
+  (29k-166k docs) took a 3,072 MB search node to 4.4-4.9 GB about 5 s before
+  they completed. The step is estimated at 6x the merged stored JSON or 2x
+  the FTS build input, whichever is larger. An admitted step grows the
+  batch's merge reservation, so concurrent merge admission sees it.
+  `_forcemerge` batches are charged but never refused, and neither is a
+  small batch that the yield-streak rule (#2468) lets run to completion.
 
 - The parent memory breaker no longer flaps, and background merges and flush
   finalizes are bounded while it is engaged (#2427). A 3,000 MB autoindex run
