@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `xerj autoindex`: Vue (`.vue`) and Svelte (`.svelte`) single-file components are indexed as code instead of being junk-filed as malformed XML. Their `<script>` blocks are parsed with the TypeScript or JavaScript grammar (by `lang`), so their declarations are symbols on the component's own lines, and the record's `language` is `vue` or `svelte`. (#2732)
+- `_reindex` applies `source._source` field filtering to the documents it
+  copies, so an excluded secret or large field no longer reaches the
+  destination. `_source:false` is refused with ES's sentence, and a `script`
+  body is refused before any work instead of silently copying the
+  untransformed document (this build has no reindex script context).
+
 - A node whose resting memory sits between the merge-pool ceiling and the
   memory watermark merges again. Every background merge's output write was
   refused there, so small batches were retried every 5 s without ever
